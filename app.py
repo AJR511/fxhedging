@@ -178,25 +178,29 @@ tenor_trading_days = max(1, int(calendar_days * (TRADING_DAYS_PER_YEAR / 365)))
 
 forward_rate = forward_rate_input
 
+# ----------------------------
+# Simulation Details
+# ----------------------------
 st.subheader("Simulation Details")
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    st.metric("Today", today.date())
+    st.metric("Today", today.strftime("%Y-%m-%d"))
 
 with col2:
-    st.metric("Settlement Date", settlement_dt.date())
+    st.metric("Settlement Date", settlement_dt.strftime("%Y-%m-%d"))
 
 with col3:
-    st.metric("Calendar Days to Maturity", calendar_days)
+    st.metric("Calendar Days to Maturity", int(calendar_days))
 
 col4, col5 = st.columns(2)
 
 with col4:
-    st.metric("Effective Trading Days for Simulation", tenor_trading_days)
+    st.metric("Effective Trading Days for Simulation", int(tenor_trading_days))
 
 with col5:
-    st.metric(f"Manually Set Forward Rate (USD/{home_currency})", f"{forward_rate:.4f}")
+    st.metric(f"Forward Rate (USD/{home_currency})", f"{forward_rate:.4f}")
 
 if tenor_trading_days >= len(spot_df):
     st.error(
@@ -205,7 +209,9 @@ if tenor_trading_days >= len(spot_df):
     )
     st.stop()
 
+# ----------------------------
 # Generate scenarios
+# ----------------------------
 results = []
 
 for i in range(len(spot_df) - tenor_trading_days):
@@ -228,24 +234,31 @@ for i in range(len(spot_df) - tenor_trading_days):
 
 results_df = pd.DataFrame(results)
 
+if results_df.empty:
+    st.error("No simulation scenarios could be generated.")
+    st.stop()
+
 mean_move = results_df["pct_move"].mean()
 results_df["demeaned_move"] = results_df["pct_move"] - mean_move
 results_df["simulated_spot"] = forward_rate * (1 + results_df["demeaned_move"])
 
-# Unhedged cash impact
+# ----------------------------
+# Cash impact
+# ----------------------------
 results_df["unhedged_mxn"] = results_df.apply(
     lambda row: unhedged_cash_impact(row, notional, direction),
     axis=1,
 )
 
-# Hedged cash impact
 for ratio in hedge_ratios_selection:
     results_df[f"hedged_{int(ratio * 100)}"] = results_df.apply(
         lambda row: hedged_cash_impact(row, ratio, notional, forward_rate),
         axis=1,
     )
 
+# ----------------------------
 # PnL calculation
+# ----------------------------
 baseline_cost = notional * forward_rate
 
 for ratio in hedge_ratios_selection:
