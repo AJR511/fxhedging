@@ -8,7 +8,7 @@ import seaborn as sns
 # ----------------------------
 # Page config
 # ----------------------------
-st.set_page_config(page_title="FX Hedging Simulation", layout="wide")
+st.set_page_config(page_title="Yarda FX Hedge Simulator", layout="wide")
 
 # ----------------------------
 # OANDA API key from Streamlit secrets
@@ -22,14 +22,59 @@ except Exception:
 client = oandapyV20.API(access_token=OANDA_API_KEY)
 
 # ----------------------------
-# Helper functions
+# Helpers
 # ----------------------------
-def unhedged_cash_impact(row, notional, direction):
-    future_spot = row["simulated_spot"]
-    if direction == "pay":
-        return notional * future_spot
-    else:  # receive
-        return notional * future_spot
+def is_business_day(date_value) -> bool:
+    ts = pd.Timestamp(date_value)
+    return ts.weekday() < 5
+
+
+def next_business_day(date_value):
+    ts = pd.Timestamp(date_value).normalize()
+    while ts.weekday() >= 5:
+        ts += pd.Timedelta(days=1)
+    return ts.date()
+
+
+def format_notional(value):
+    return f"{value:,.0f}"
+
+
+def get_hedge_action(transaction_direction):
+    return "Buy" if transaction_direction == "pay" else "Sell"
+
+
+def get_pair_label(foreign_currency, local_currency):
+    return f"{foreign_currency}/{local_currency}"
+
+
+def get_pair_history(base_df, foreign_currency, local_currency):
+    """
+    base_df comes from USD/MXN OANDA history.
+    We support only:
+    - USD/MXN directly
+    - MXN/USD via inversion
+    """
+    if foreign_currency == local_currency:
+        return pd.DataFrame()
+
+    pair_df = base_df.copy()
+
+    if foreign_currency == "USD" and local_currency == "MXN":
+        pair_df["spot"] = pair_df["spot"]
+        pair_df["pair"] = "USD/MXN"
+        return pair_df
+
+    if foreign_currency == "MXN" and local_currency == "USD":
+        pair_df["spot"] = 1 / pair_df["spot"]
+        pair_df["pair"] = "MXN/USD"
+        return pair_df
+
+    return pd.DataFrame()
+
+
+def unhedged_cash_impact(row, notional):
+    return notional * row["simulated_spot"]
 
 
 def hedged_cash_impact(row, hedge_ratio, notional, forward_rate):
@@ -51,7 +96,7 @@ def summarize_pnl(series):
 # Data fetch
 # ----------------------------
 @st.cache_data(ttl=3600)
-def fetch_oanda_spot_data():
+def fetch_usd_mxn_spot_data():
     instrument = "USD_MXN"
     all_oanda_data = []
     end_date = pd.Timestamp.now(tz="UTC").floor("D")
@@ -102,71 +147,137 @@ def fetch_oanda_spot_data():
             .drop_duplicates(subset=["date"])
             .reset_index(drop=True)
         )
-        oanda_spot_df["pair"] = instrument.replace("_", "/")
+        oanda_spot_df["pair"] = "USD/MXN"
         return oanda_spot_df
 
     return pd.DataFrame()
 
 
 # ----------------------------
+# Session state
+# ----------------------------
+if "run_simulation" not in st.session_state:
+    st.session_state.run_simulation = False
+
+# ----------------------------
 # App header
 # ----------------------------
-st.title("FX Hedging Simulation")
-st.sidebar.header("Simulation Parameters")
+st.title("Yarda FX Hedge Simulator")
+st.caption(
+    "Illustrative tool only. This simulator uses historical FX moves to show how a hedge might behave."
+)
 
 # ----------------------------
-# Inputs
+# Sidebar inputs
 # ----------------------------
-direction = st.sidebar.radio("Transaction Direction", ("pay", "receive"), index=0)
+st.sidebar.header("Tell us about your exposure")
 
-notional = st.sidebar.number_input(
-    "Notional Amount (USD)",
-    min_value=1000,
-    value=1_000_000,
-    step=1000,
-)
+today = pd.Timestamp.now().normalize()
+default_settlement = next_business_day(today + pd.Timedelta(days=1))
 
-settlement_date_input = st.sidebar.date_input(
-    "Settlement Date",
-    value=pd.to_datetime("2026-06-30"),
-)
+with st.sidebar.form("hedge_form"):
+    transaction_direction = st.radio(
+        'My business will...',
+        ("pay", "receive"),
+        index=0,
+        horizontal=True
+    )
 
-forward_rate_input = st.sidebar.number_input(
-    "Forward Rate (USD/MXN)",
-    min_value=1.0,
-    value=18.4568,
-    step=0.0001,
-    format="%.4f",
-)
+    foreign_currency = st.selectbox(
+        "Foreign currency",
+        options=["USD", "MXN"],
+        index=0
+    )
 
-hedge_ratios_selection = st.sidebar.multiselect(
-    "Select Hedge Ratios",
-    options=[0.0, 0.25, 0.5, 0.75, 1.0],
-    default=[0.0, 0.5, 1.0],
-)
+    settlement_date_input = st.date_input(
+        "Date",
+        value=default_settlement,
+        min_value=default_settlement
+    )
 
-if not hedge_ratios_selection:
-    st.sidebar.warning("Please select at least one hedge ratio.")
+    local_currency = st.selectbox(
+        "Local currency",
+        options=["USD", "MXN"],
+        index=1
+    )
+
+    st.markdown(
+        f'My business will **{transaction_direction}** **{foreign_currency}** on '
+        f'**{pd.Timestamp(settlement_date_input).strftime("%Y-%m-%d")}**, '
+        f'and my business operates in **{local_currency}**.'
+    )
+
+    notional = st.number_input(
+        f"Notional amount ({foreign_currency})",
+        min_value=1000.0,
+        value=1_000_000.0,
+        step=1000.0
+    )
+
+    default_forward = 18.4568 if (foreign_currency == "USD" and local_currency == "MXN") else 0.0542
+
+    forward_rate_input = st.number_input(
+        f"Forward rate ({foreign_currency}/{local_currency})",
+        min_value=0.000001,
+        value=float(default_forward),
+        step=0.0001,
+        format="%.4f"
+    )
+
+    hedge_ratios_selection = st.multiselect(
+        "Hedge ratios to compare",
+        options=[0.0, 0.25, 0.5, 0.75, 1.0],
+        default=[0.0, 0.5, 1.0]
+    )
+
+    submitted = st.form_submit_button("What will a hedge look like?")
+
+if submitted:
+    st.session_state.run_simulation = True
+
+if not st.session_state.run_simulation:
+    st.info("Fill in the exposure details on the left and click “What will a hedge look like?”")
     st.stop()
 
-home_currency = "MXN"
+# ----------------------------
+# Validation
+# ----------------------------
+if foreign_currency == local_currency:
+    st.warning("Foreign currency and local currency must be different.")
+    st.stop()
+
+if not is_business_day(settlement_date_input):
+    st.warning("Please choose a weekday settlement date.")
+    st.stop()
+
+if not hedge_ratios_selection:
+    st.warning("Please select at least one hedge ratio.")
+    st.stop()
+
+pair_label = get_pair_label(foreign_currency, local_currency)
+hedge_action = get_hedge_action(transaction_direction)
+settlement_dt = pd.to_datetime(settlement_date_input).normalize()
+local_currency_label = local_currency
 
 # ----------------------------
 # Load spot data
 # ----------------------------
-with st.spinner("Fetching historical USD/MXN data from OANDA..."):
-    spot_df = fetch_oanda_spot_data()
+with st.spinner("Fetching historical FX data from OANDA..."):
+    usd_mxn_df = fetch_usd_mxn_spot_data()
+
+if usd_mxn_df.empty:
+    st.error("No data fetched from OANDA for the specified period.")
+    st.stop()
+
+spot_df = get_pair_history(usd_mxn_df, foreign_currency, local_currency)
 
 if spot_df.empty:
-    st.error("No data fetched from OANDA for the specified period.")
+    st.error("This version currently supports only USD/MXN and MXN/USD.")
     st.stop()
 
 # ----------------------------
 # Simulation logic
 # ----------------------------
-today = pd.Timestamp.now().normalize()
-settlement_dt = pd.to_datetime(settlement_date_input).normalize()
-
 calendar_days = (settlement_dt - today).days
 
 if calendar_days <= 0:
@@ -175,11 +286,32 @@ if calendar_days <= 0:
 
 TRADING_DAYS_PER_YEAR = 252
 tenor_trading_days = max(1, int(calendar_days * (TRADING_DAYS_PER_YEAR / 365)))
+forward_rate = float(forward_rate_input)
 
-forward_rate = forward_rate_input
+if tenor_trading_days >= len(spot_df):
+    st.error(
+        f"Not enough historical data ({len(spot_df)} records) to simulate "
+        f"{tenor_trading_days} trading days."
+    )
+    st.stop()
 
 # ----------------------------
-# Simulation Details
+# Hedge recommendation
+# ----------------------------
+st.subheader("Recommended full hedge")
+
+st.markdown(
+    f"To fully hedge your position, your company needs to **{hedge_action}** "
+    f"**{format_notional(notional)} {foreign_currency}** via a "
+    f"**{pair_label} forward** maturing on **{settlement_dt.strftime('%Y-%m-%d')}**."
+)
+
+st.markdown(
+    f"Based on historical data of **{pair_label}**, this is how a hedge should behave."
+)
+
+# ----------------------------
+# Simulation details
 # ----------------------------
 st.subheader("Simulation Details")
 
@@ -194,20 +326,16 @@ with col2:
 with col3:
     st.metric("Calendar Days to Maturity", int(calendar_days))
 
-col4, col5 = st.columns(2)
+col4, col5, col6 = st.columns(3)
 
 with col4:
-    st.metric("Effective Trading Days for Simulation", int(tenor_trading_days))
+    st.metric("Effective Trading Days", int(tenor_trading_days))
 
 with col5:
-    st.metric(f"Forward Rate (USD/{home_currency})", f"{forward_rate:.4f}")
+    st.metric("Notional", f"{format_notional(notional)} {foreign_currency}")
 
-if tenor_trading_days >= len(spot_df):
-    st.error(
-        f"Not enough historical data ({len(spot_df)} records) to simulate "
-        f"{tenor_trading_days} trading days."
-    )
-    st.stop()
+with col6:
+    st.metric(f"Forward Rate ({pair_label})", f"{forward_rate:.4f}")
 
 # ----------------------------
 # Generate scenarios
@@ -245,8 +373,8 @@ results_df["simulated_spot"] = forward_rate * (1 + results_df["demeaned_move"])
 # ----------------------------
 # Cash impact
 # ----------------------------
-results_df["unhedged_mxn"] = results_df.apply(
-    lambda row: unhedged_cash_impact(row, notional, direction),
+results_df["unhedged_local"] = results_df.apply(
+    lambda row: unhedged_cash_impact(row, notional),
     axis=1,
 )
 
@@ -257,21 +385,21 @@ for ratio in hedge_ratios_selection:
     )
 
 # ----------------------------
-# PnL calculation
+# PnL calculation in local currency
 # ----------------------------
 baseline_cost = notional * forward_rate
 
 for ratio in hedge_ratios_selection:
     if ratio == 0.0:
-        value_col = "unhedged_mxn"
+        value_col = "unhedged_local"
         pnl_col = "pnl_unhedged"
     else:
         value_col = f"hedged_{int(ratio * 100)}"
         pnl_col = f"pnl_{int(ratio * 100)}"
 
-    if direction == "pay":
+    if transaction_direction == "pay":
         results_df[pnl_col] = baseline_cost - results_df[value_col]
-    else:  # receive
+    else:
         results_df[pnl_col] = results_df[value_col] - baseline_cost
 
 # ----------------------------
@@ -299,15 +427,15 @@ summary_df = pd.DataFrame(summary_data)
 st.dataframe(
     summary_df.set_index("Strategy").style.format(
         {
-            "Worst Case PnL": "{:,.0f} MXN",
-            "Best Case PnL": "{:,.0f} MXN",
-            "Average PnL": "{:,.0f} MXN",
+            "Worst Case PnL": f"{{:,.0f}} {local_currency_label}",
+            "Best Case PnL": f"{{:,.0f}} {local_currency_label}",
+            "Average PnL": f"{{:,.0f}} {local_currency_label}",
         }
     )
 )
 
 # ----------------------------
-# Violin plot
+# Chart
 # ----------------------------
 st.header("PnL Distribution Across Hedging Strategies")
 
@@ -339,9 +467,9 @@ sns.violinplot(
     legend=False,
 )
 
-ax.set_title("PnL Distribution Across Hedging Strategies")
+ax.set_title(f"Historical Hedge Outcome Distribution: {pair_label}")
 ax.set_xlabel("Hedging Strategy")
-ax.set_ylabel(f"PnL ({home_currency})")
+ax.set_ylabel(f"PnL ({local_currency_label})")
 ax.axhline(0, color="grey", linestyle="--", linewidth=0.8)
 ax.grid(axis="y", linestyle="--", alpha=0.7)
 
@@ -352,3 +480,13 @@ st.pyplot(fig)
 # ----------------------------
 with st.expander("Show raw simulation data"):
     st.dataframe(results_df)
+
+# ----------------------------
+# Optional CSV export
+# ----------------------------
+st.download_button(
+    label="Download simulation results (CSV)",
+    data=results_df.to_csv(index=False),
+    file_name="fx_simulation_results.csv",
+    mime="text/csv"
+)
