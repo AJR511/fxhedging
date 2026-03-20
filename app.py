@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-import oandapyV20
-import oandapyV20.endpoints.instruments as instruments
+import requests
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -11,15 +10,19 @@ import seaborn as sns
 st.set_page_config(page_title="Yarda FX Hedge Simulator", layout="wide")
 
 # ----------------------------
-# OANDA API key from Streamlit secrets
+# Secrets
 # ----------------------------
 try:
-    OANDA_API_KEY = st.secrets["OANDA_API_KEY"]
+    FRED_API_KEY = st.secrets["FRED_API_KEY"]
 except Exception:
-    st.error("OANDA_API_KEY not found in Streamlit secrets.")
+    st.error("FRED_API_KEY not found in Streamlit secrets.")
     st.stop()
 
-client = oandapyV20.API(access_token=OANDA_API_KEY)
+try:
+    BANXICO_API_TOKEN = st.secrets["BANXICO_API_TOKEN"]
+except Exception:
+    st.error("BANXICO_API_TOKEN not found in Streamlit secrets.")
+    st.stop()
 
 # ----------------------------
 # Helpers
@@ -48,9 +51,177 @@ def get_pair_label(foreign_currency, local_currency):
     return f"{foreign_currency}/{local_currency}"
 
 
+def unhedged_cash_impact(row, notional):
+    return notional * row["simulated_spot"]
+
+
+def hedged_cash_impact(row, hedge_ratio, notional, forward_rate):
+    future_spot = row["simulated_spot"]
+    hedged_part = hedge_ratio * notional * forward_rate
+    unhedged_part = (1 - hedge_ratio) * notional * future_spot
+    return hedged_part + unhedged_part
+
+
+def summarize_pnl(series):
+    return {
+        "best_case": round(series.max(), 0),
+        "worst_case": round(series.min(), 0),
+        "average": round(series.mean(), 0),
+    }
+
+
+# ----------------------------
+# Banxico / FRED fetchers
+# ----------------------------
+@st.cache_data(ttl=3600)
+def fetch_banxico_series_full(series_id: str):
+    """
+    Returns:
+        {
+            "series_id": str,
+            "title": str,
+            "date": str,
+            "value": float,
+            "raw_data": list[dict]
+        }
+    """
+    url = f"https://www.banxico.org.mx/SieAPIRest/service/v1/series/{series_id}/datos"
+    headers = {"Bmx-Token": BANXICO_API_TOKEN}
+
+    response = requests.get(url, headers=headers, timeout=20)
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if "bmx" not in payload or "series" not in payload["bmx"]:
+        raise ValueError(f"Unexpected Banxico response for series {series_id}")
+
+    series_list = payload["bmx"]["series"]
+    if not series_list:
+        raise ValueError(f"No Banxico series returned for {series_id}")
+
+    series = series_list[0]
+    datos = series.get("datos", [])
+
+    latest_valid = None
+    for entry in reversed(datos):
+        dato = str(entry.get("dato", "")).strip()
+        if dato not in ["N/E", "", "null", "None"]:
+            latest_valid = entry
+            break
+
+    if latest_valid is None:
+        raise ValueError(f"No valid Banxico datapoints found for {series_id}")
+
+    value = float(str(latest_valid["dato"]).replace(",", ""))
+
+    return {
+        "series_id": series_id,
+        "title": series.get("titulo", series_id),
+        "date": latest_valid.get("fecha"),
+        "value": value,
+        "raw_data": datos,
+    }
+
+
+@st.cache_data(ttl=3600)
+def fetch_fred_latest(series_id: str):
+    """
+    Returns:
+        {
+            "series_id": str,
+            "date": str,
+            "value": float   # decimal, not percent
+        }
+    """
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "sort_order": "desc",
+        "limit": 10,
+    }
+
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+
+    payload = response.json()
+    observations = payload.get("observations", [])
+
+    if not observations:
+        raise ValueError(f"No FRED observations returned for {series_id}")
+
+    latest_valid = None
+    for obs in observations:
+        val = str(obs.get("value", "")).strip()
+        if val not in [".", "", "null", "None"]:
+            latest_valid = obs
+            break
+
+    if latest_valid is None:
+        raise ValueError(f"No valid FRED datapoints found for {series_id}")
+
+    return {
+        "series_id": series_id,
+        "date": latest_valid["date"],
+        "value": float(latest_valid["value"]) / 100.0,
+    }
+
+
+@st.cache_data(ttl=3600)
+def fetch_banxico_fix_history():
+    """
+    Pulls Banxico USD/MXN FIX history and converts it into a dataframe
+    with columns:
+        date, spot, pair
+    """
+    data = fetch_banxico_series_full("SF43718")
+    rows = []
+
+    for entry in data["raw_data"]:
+        dato = str(entry.get("dato", "")).strip()
+        fecha = entry.get("fecha")
+
+        if dato in ["N/E", "", "null", "None"]:
+            continue
+
+        try:
+            spot_value = float(dato.replace(",", ""))
+        except Exception:
+            continue
+
+        parsed_date = pd.to_datetime(fecha, dayfirst=True, errors="coerce")
+        if pd.isna(parsed_date):
+            parsed_date = pd.to_datetime(fecha, errors="coerce")
+
+        if pd.isna(parsed_date):
+            continue
+
+        rows.append(
+            {
+                "date": parsed_date,
+                "spot": spot_value,
+                "pair": "USD/MXN",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df = (
+        df.sort_values("date")
+        .drop_duplicates(subset=["date"])
+        .reset_index(drop=True)
+    )
+
+    return df
+
+
 def get_pair_history(base_df, foreign_currency, local_currency):
     """
-    base_df comes from USD/MXN OANDA history.
+    base_df comes from Banxico USD/MXN FIX history.
     We support only:
     - USD/MXN directly
     - MXN/USD via inversion
@@ -73,86 +244,6 @@ def get_pair_history(base_df, foreign_currency, local_currency):
     return pd.DataFrame()
 
 
-def unhedged_cash_impact(row, notional):
-    return notional * row["simulated_spot"]
-
-
-def hedged_cash_impact(row, hedge_ratio, notional, forward_rate):
-    future_spot = row["simulated_spot"]
-    hedged_part = hedge_ratio * notional * forward_rate
-    unhedged_part = (1 - hedge_ratio) * notional * future_spot
-    return hedged_part + unhedged_part
-
-
-def summarize_pnl(series):
-    return {
-        "best_case": round(series.max(), 0),
-        "worst_case": round(series.min(), 0),
-        "average": round(series.mean(), 0),
-    }
-
-
-# ----------------------------
-# Data fetch
-# ----------------------------
-@st.cache_data(ttl=3600)
-def fetch_usd_mxn_spot_data():
-    instrument = "USD_MXN"
-    all_oanda_data = []
-    end_date = pd.Timestamp.now(tz="UTC").floor("D")
-    start_date = end_date - pd.DateOffset(years=20)
-    current_chunk_end = end_date
-
-    while current_chunk_end > start_date:
-        params = {
-            "granularity": "D",
-            "to": current_chunk_end.isoformat(),
-            "count": 5000,
-        }
-
-        r = instruments.InstrumentsCandles(instrument=instrument, params=params)
-        client.request(r)
-
-        if r.response and "candles" in r.response:
-            chunk_data = []
-
-            for candle in r.response["candles"]:
-                if candle.get("complete", True) and "mid" in candle:
-                    chunk_data.append(
-                        {
-                            "date": pd.to_datetime(candle["time"]),
-                            "spot": float(candle["mid"]["c"]),
-                        }
-                    )
-
-            if chunk_data:
-                all_oanda_data.extend(chunk_data)
-
-                oldest_candle_time = pd.to_datetime(r.response["candles"][0]["time"])
-                next_chunk_end = oldest_candle_time - pd.Timedelta(days=1)
-
-                if next_chunk_end >= current_chunk_end:
-                    break
-
-                current_chunk_end = next_chunk_end
-            else:
-                break
-        else:
-            break
-
-    if all_oanda_data:
-        oanda_spot_df = pd.DataFrame(all_oanda_data)
-        oanda_spot_df = (
-            oanda_spot_df.sort_values("date")
-            .drop_duplicates(subset=["date"])
-            .reset_index(drop=True)
-        )
-        oanda_spot_df["pair"] = "USD/MXN"
-        return oanda_spot_df
-
-    return pd.DataFrame()
-
-
 # ----------------------------
 # Session state
 # ----------------------------
@@ -164,7 +255,7 @@ if "run_simulation" not in st.session_state:
 # ----------------------------
 st.title("Yarda FX Hedge Simulator")
 st.caption(
-    "Illustrative tool only. This simulator uses historical FX moves to show how a hedge might behave."
+    "Illustrative tool only. This version tests Banxico and FRED market-data integration."
 )
 
 # ----------------------------
@@ -177,7 +268,7 @@ default_settlement = next_business_day(today + pd.Timedelta(days=1))
 
 with st.sidebar.form("hedge_form"):
     transaction_direction = st.radio(
-        'My business will...',
+        "My business will...",
         ("pay", "receive"),
         index=0,
         horizontal=True
@@ -202,9 +293,9 @@ with st.sidebar.form("hedge_form"):
     )
 
     st.markdown(
-        f'My business will **{transaction_direction}** **{foreign_currency}** on '
-        f'**{pd.Timestamp(settlement_date_input).strftime("%Y-%m-%d")}**, '
-        f'and my business operates in **{local_currency}**.'
+        f"My business will **{transaction_direction}** **{foreign_currency}** on "
+        f"**{pd.Timestamp(settlement_date_input).strftime('%Y-%m-%d')}**, "
+        f"and my business operates in **{local_currency}**."
     )
 
     notional = st.number_input(
@@ -258,15 +349,66 @@ pair_label = get_pair_label(foreign_currency, local_currency)
 hedge_action = get_hedge_action(transaction_direction)
 settlement_dt = pd.to_datetime(settlement_date_input).normalize()
 local_currency_label = local_currency
+forward_rate = float(forward_rate_input)
 
 # ----------------------------
-# Load spot data
+# Market data test block
 # ----------------------------
-with st.spinner("Fetching historical FX data from OANDA..."):
-    usd_mxn_df = fetch_usd_mxn_spot_data()
+st.header("Market Data Test")
 
+banxico_ok = False
+fred_ok = False
+
+with st.spinner("Fetching Banxico and FRED data..."):
+    try:
+        banxico_fix = fetch_banxico_series_full("SF43718")
+        tiie_28 = fetch_banxico_series_full("SF60648")
+        tiie_91 = fetch_banxico_series_full("SF60649")
+        usd_mxn_df = fetch_banxico_fix_history()
+        banxico_ok = True
+    except Exception as e:
+        banxico_error = str(e)
+        usd_mxn_df = pd.DataFrame()
+
+    try:
+        sofr = fetch_fred_latest("SOFR")
+        fred_ok = True
+    except Exception as e:
+        fred_error = str(e)
+
+if not banxico_ok:
+    st.error(f"Banxico fetch failed: {banxico_error}")
+    st.stop()
+
+if not fred_ok:
+    st.error(f"FRED fetch failed: {fred_error}")
+    st.stop()
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric("Banxico FIX (USD/MXN)", f"{banxico_fix['value']:.4f}")
+    st.caption(f"Date: {banxico_fix['date']}")
+
+with col2:
+    st.metric("TIIE 28d", f"{tiie_28['value']:.4f}%")
+    st.caption(f"Date: {tiie_28['date']}")
+
+with col3:
+    st.metric("TIIE 91d", f"{tiie_91['value']:.4f}%")
+    st.caption(f"Date: {tiie_91['date']}")
+
+with col4:
+    st.metric("SOFR", f"{sofr['value'] * 100:.4f}%")
+    st.caption(f"Date: {sofr['date']}")
+
+st.success("Market data test successful. Banxico and FRED are connected.")
+
+# ----------------------------
+# Load spot history
+# ----------------------------
 if usd_mxn_df.empty:
-    st.error("No data fetched from OANDA for the specified period.")
+    st.error("No Banxico FIX history could be built.")
     st.stop()
 
 spot_df = get_pair_history(usd_mxn_df, foreign_currency, local_currency)
@@ -286,7 +428,6 @@ if calendar_days <= 0:
 
 TRADING_DAYS_PER_YEAR = 252
 tenor_trading_days = max(1, int(calendar_days * (TRADING_DAYS_PER_YEAR / 365)))
-forward_rate = float(forward_rate_input)
 
 if tenor_trading_days >= len(spot_df):
     st.error(
@@ -307,7 +448,7 @@ st.markdown(
 )
 
 st.markdown(
-    f"Based on historical data of **{pair_label}**, this is how a hedge should behave."
+    f"This test version uses **Banxico FIX history** for scenario generation and your manually entered forward rate of **{forward_rate:.4f}**."
 )
 
 # ----------------------------
@@ -474,6 +615,17 @@ ax.axhline(0, color="grey", linestyle="--", linewidth=0.8)
 ax.grid(axis="y", linestyle="--", alpha=0.7)
 
 st.pyplot(fig)
+
+# ----------------------------
+# Optional diagnostics
+# ----------------------------
+with st.expander("Show market data diagnostics"):
+    st.write("Banxico FIX latest:", banxico_fix)
+    st.write("Banxico TIIE 28d latest:", tiie_28)
+    st.write("Banxico TIIE 91d latest:", tiie_91)
+    st.write("FRED SOFR latest:", sofr)
+    st.write("Banxico FIX history preview:")
+    st.dataframe(usd_mxn_df.tail(20))
 
 # ----------------------------
 # Optional raw data preview
