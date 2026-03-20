@@ -70,21 +70,41 @@ def summarize_pnl(series):
     }
 
 
+def linear_interpolate(x, x0, y0, x1, y1):
+    if x1 == x0:
+        return y0
+    return y0 + (y1 - y0) * ((x - x0) / (x1 - x0))
+
+
+def interpolate_mxn_rate(target_days, tiie_28_pct, tiie_91_pct):
+    """
+    Returns MXN annualized rate in decimal form.
+    Rule set for MVP:
+    - <= 28d -> use TIIE 28d
+    - >= 91d -> use TIIE 91d
+    - otherwise linearly interpolate
+    """
+    r28 = tiie_28_pct / 100.0
+    r91 = tiie_91_pct / 100.0
+
+    if target_days <= 28:
+        return r28
+    if target_days >= 91:
+        return r91
+
+    return linear_interpolate(target_days, 28, r28, 91, r91)
+
+
+def synthetic_forward(spot, r_mxn, r_usd, days, basis=360):
+    tau = days / basis
+    return spot * ((1 + r_mxn * tau) / (1 + r_usd * tau))
+
+
 # ----------------------------
 # Banxico / FRED fetchers
 # ----------------------------
 @st.cache_data(ttl=3600)
 def fetch_banxico_series_full(series_id: str):
-    """
-    Returns:
-        {
-            "series_id": str,
-            "title": str,
-            "date": str,
-            "value": float,
-            "raw_data": list[dict]
-        }
-    """
     url = f"https://www.banxico.org.mx/SieAPIRest/service/v1/series/{series_id}/datos"
     headers = {"Bmx-Token": BANXICO_API_TOKEN}
 
@@ -126,14 +146,6 @@ def fetch_banxico_series_full(series_id: str):
 
 @st.cache_data(ttl=3600)
 def fetch_fred_latest(series_id: str):
-    """
-    Returns:
-        {
-            "series_id": str,
-            "date": str,
-            "value": float   # decimal, not percent
-        }
-    """
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": series_id,
@@ -165,17 +177,12 @@ def fetch_fred_latest(series_id: str):
     return {
         "series_id": series_id,
         "date": latest_valid["date"],
-        "value": float(latest_valid["value"]) / 100.0,
+        "value": float(latest_valid["value"]) / 100.0,  # decimal
     }
 
 
 @st.cache_data(ttl=3600)
 def fetch_banxico_fix_history():
-    """
-    Pulls Banxico USD/MXN FIX history and converts it into a dataframe
-    with columns:
-        date, spot, pair
-    """
     data = fetch_banxico_series_full("SF43718")
     rows = []
 
@@ -222,7 +229,7 @@ def fetch_banxico_fix_history():
 def get_pair_history(base_df, foreign_currency, local_currency):
     """
     base_df comes from Banxico USD/MXN FIX history.
-    We support only:
+    Supports:
     - USD/MXN directly
     - MXN/USD via inversion
     """
@@ -255,7 +262,7 @@ if "run_simulation" not in st.session_state:
 # ----------------------------
 st.title("Yarda FX Hedge Simulator")
 st.caption(
-    "Illustrative tool only. This version tests Banxico and FRED market-data integration."
+    "Illustrative tool only. Synthetic forward uses Banxico FIX, Banxico TIIE and FRED SOFR."
 )
 
 # ----------------------------
@@ -264,7 +271,7 @@ st.caption(
 st.sidebar.header("Tell us about your exposure")
 
 today = pd.Timestamp.now().normalize()
-default_settlement = next_business_day(today + pd.Timedelta(days=1))
+default_settlement = next_business_day(today + pd.Timedelta(days=30))
 
 with st.sidebar.form("hedge_form"):
     transaction_direction = st.radio(
@@ -305,16 +312,6 @@ with st.sidebar.form("hedge_form"):
         step=1000.0
     )
 
-    default_forward = 18.4568 if (foreign_currency == "USD" and local_currency == "MXN") else 0.0542
-
-    forward_rate_input = st.number_input(
-        f"Forward rate ({foreign_currency}/{local_currency})",
-        min_value=0.000001,
-        value=float(default_forward),
-        step=0.0001,
-        format="%.4f"
-    )
-
     hedge_ratios_selection = st.multiselect(
         "Hedge ratios to compare",
         options=[0.0, 0.25, 0.5, 0.75, 1.0],
@@ -349,40 +346,67 @@ pair_label = get_pair_label(foreign_currency, local_currency)
 hedge_action = get_hedge_action(transaction_direction)
 settlement_dt = pd.to_datetime(settlement_date_input).normalize()
 local_currency_label = local_currency
-forward_rate = float(forward_rate_input)
+calendar_days = (settlement_dt - today).days
+
+if calendar_days <= 0:
+    st.warning("Settlement date must be in the future.")
+    st.stop()
 
 # ----------------------------
-# Market data test block
+# Market data load
 # ----------------------------
-st.header("Market Data Test")
-
-banxico_ok = False
-fred_ok = False
-
 with st.spinner("Fetching Banxico and FRED data..."):
     try:
         banxico_fix = fetch_banxico_series_full("SF43718")
         tiie_28 = fetch_banxico_series_full("SF60648")
         tiie_91 = fetch_banxico_series_full("SF60649")
-        usd_mxn_df = fetch_banxico_fix_history()
-        banxico_ok = True
-    except Exception as e:
-        banxico_error = str(e)
-        usd_mxn_df = pd.DataFrame()
-
-    try:
         sofr = fetch_fred_latest("SOFR")
-        fred_ok = True
+        usd_mxn_df = fetch_banxico_fix_history()
     except Exception as e:
-        fred_error = str(e)
+        st.error(f"Market data fetch failed: {e}")
+        st.stop()
 
-if not banxico_ok:
-    st.error(f"Banxico fetch failed: {banxico_error}")
+if usd_mxn_df.empty:
+    st.error("No Banxico FIX history could be built.")
     st.stop()
 
-if not fred_ok:
-    st.error(f"FRED fetch failed: {fred_error}")
+spot_df = get_pair_history(usd_mxn_df, foreign_currency, local_currency)
+
+if spot_df.empty:
+    st.error("This version currently supports only USD/MXN and MXN/USD.")
     st.stop()
+
+# ----------------------------
+# Synthetic forward calculation
+# ----------------------------
+spot_reference = float(banxico_fix["value"])
+
+# Rates for USD/MXN convention
+mxn_rate = interpolate_mxn_rate(calendar_days, tiie_28["value"], tiie_91["value"])
+usd_rate = float(sofr["value"])  # already decimal
+
+synthetic_forward_usd_mxn = synthetic_forward(
+    spot=spot_reference,
+    r_mxn=mxn_rate,
+    r_usd=usd_rate,
+    days=calendar_days,
+    basis=360,
+)
+
+# Handle MXN/USD if user flips pair
+if foreign_currency == "USD" and local_currency == "MXN":
+    forward_rate = synthetic_forward_usd_mxn
+    spot_display = spot_reference
+    forward_points = synthetic_forward_usd_mxn - spot_reference
+else:
+    forward_rate = 1 / synthetic_forward_usd_mxn
+    spot_display = 1 / spot_reference
+    forward_points = forward_rate - spot_display
+
+# ----------------------------
+# Market data summary
+# ----------------------------
+st.header("Market Data Snapshot")
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -402,40 +426,6 @@ with col4:
     st.metric("SOFR", f"{sofr['value'] * 100:.4f}%")
     st.caption(f"Date: {sofr['date']}")
 
-st.success("Market data test successful. Banxico and FRED are connected.")
-
-# ----------------------------
-# Load spot history
-# ----------------------------
-if usd_mxn_df.empty:
-    st.error("No Banxico FIX history could be built.")
-    st.stop()
-
-spot_df = get_pair_history(usd_mxn_df, foreign_currency, local_currency)
-
-if spot_df.empty:
-    st.error("This version currently supports only USD/MXN and MXN/USD.")
-    st.stop()
-
-# ----------------------------
-# Simulation logic
-# ----------------------------
-calendar_days = (settlement_dt - today).days
-
-if calendar_days <= 0:
-    st.warning("Settlement date must be in the future.")
-    st.stop()
-
-TRADING_DAYS_PER_YEAR = 252
-tenor_trading_days = max(1, int(calendar_days * (TRADING_DAYS_PER_YEAR / 365)))
-
-if tenor_trading_days >= len(spot_df):
-    st.error(
-        f"Not enough historical data ({len(spot_df)} records) to simulate "
-        f"{tenor_trading_days} trading days."
-    )
-    st.stop()
-
 # ----------------------------
 # Hedge recommendation
 # ----------------------------
@@ -448,8 +438,48 @@ st.markdown(
 )
 
 st.markdown(
-    f"This test version uses **Banxico FIX history** for scenario generation and your manually entered forward rate of **{forward_rate:.4f}**."
+    f"This illustrative forward is derived from **Banxico FIX spot**, **Banxico TIIE**, and **FRED SOFR**."
 )
+
+# ----------------------------
+# Pricing details
+# ----------------------------
+st.subheader("Pricing Details")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric("Spot Reference", f"{spot_display:.4f}")
+
+with col2:
+    st.metric(f"Synthetic Forward ({pair_label})", f"{forward_rate:.4f}")
+
+with col3:
+    st.metric("Forward Points", f"{forward_points:.4f}")
+
+col4, col5, col6 = st.columns(3)
+
+with col4:
+    st.metric("Calendar Days to Maturity", int(calendar_days))
+
+with col5:
+    st.metric("Implied MXN Rate", f"{mxn_rate * 100:.4f}%")
+
+with col6:
+    st.metric("USD Rate Proxy", f"{usd_rate * 100:.4f}%")
+
+# ----------------------------
+# Simulation logic
+# ----------------------------
+TRADING_DAYS_PER_YEAR = 252
+tenor_trading_days = max(1, int(calendar_days * (TRADING_DAYS_PER_YEAR / 365)))
+
+if tenor_trading_days >= len(spot_df):
+    st.error(
+        f"Not enough historical data ({len(spot_df)} records) to simulate "
+        f"{tenor_trading_days} trading days."
+    )
+    st.stop()
 
 # ----------------------------
 # Simulation details
@@ -465,18 +495,18 @@ with col2:
     st.metric("Settlement Date", settlement_dt.strftime("%Y-%m-%d"))
 
 with col3:
-    st.metric("Calendar Days to Maturity", int(calendar_days))
+    st.metric("Effective Trading Days", int(tenor_trading_days))
 
 col4, col5, col6 = st.columns(3)
 
 with col4:
-    st.metric("Effective Trading Days", int(tenor_trading_days))
-
-with col5:
     st.metric("Notional", f"{format_notional(notional)} {foreign_currency}")
 
+with col5:
+    st.metric(f"Forward Rate Used ({pair_label})", f"{forward_rate:.4f}")
+
 with col6:
-    st.metric(f"Forward Rate ({pair_label})", f"{forward_rate:.4f}")
+    st.metric("Scenario Source", "Banxico FIX history")
 
 # ----------------------------
 # Generate scenarios
@@ -617,24 +647,24 @@ ax.grid(axis="y", linestyle="--", alpha=0.7)
 st.pyplot(fig)
 
 # ----------------------------
-# Optional diagnostics
+# Diagnostics
 # ----------------------------
-with st.expander("Show market data diagnostics"):
+with st.expander("Show pricing diagnostics"):
     st.write("Banxico FIX latest:", banxico_fix)
     st.write("Banxico TIIE 28d latest:", tiie_28)
     st.write("Banxico TIIE 91d latest:", tiie_91)
     st.write("FRED SOFR latest:", sofr)
-    st.write("Banxico FIX history preview:")
-    st.dataframe(usd_mxn_df.tail(20))
+    st.write("Spot reference used:", spot_display)
+    st.write("Synthetic forward used:", forward_rate)
+    st.write("Forward points:", forward_points)
+    st.write("Implied MXN rate:", mxn_rate)
+    st.write("USD rate proxy:", usd_rate)
 
-# ----------------------------
-# Optional raw data preview
-# ----------------------------
 with st.expander("Show raw simulation data"):
     st.dataframe(results_df)
 
 # ----------------------------
-# Optional CSV export
+# CSV export
 # ----------------------------
 st.download_button(
     label="Download simulation results (CSV)",
